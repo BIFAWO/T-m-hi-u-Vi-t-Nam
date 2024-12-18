@@ -1,202 +1,203 @@
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
-import requests
+import logging
+import pandas as pd
 import random
-import csv
-from io import StringIO
-from PIL import Image, ImageDraw, ImageFont
+from telegram import Update, ReplyKeyboardMarkup
+from telegram.ext import (
+    Updater, CommandHandler, MessageHandler, Filters, CallbackContext
+)
 
-# Token của Telegram bot
-TELEGRAM_TOKEN = '8161313133:AAFcvw3RhIzdoz7cWZqeVGEWuYyB3b1qCCI'
+from apscheduler.jobstores.base import ConflictingIdError
 
-# Link Google Sheets (chế độ công khai)
-GOOGLE_SHEET_CSV_URL = 'https://docs.google.com/spreadsheets/d/1QMKiohAaO5QtHoQwBX5efTXCI_Q791A4GnoCe9nMV2w/export?format=csv'
+# Bot Constants
+TOKEN = "7815935889:AAEkxqMcB8dY-cFrv7wf1zG2jSALT_htJ-A"
+SHEET_URL = "https://docs.google.com/spreadsheets/d/1huvzJxg_hRw4w3urQOYusq_-JGdxaSzMHtBltM9w7UA/export?format=csv&gid=827841763"
 
-# Danh sách câu hỏi, câu hỏi hiện tại, và điểm số
-QUESTIONS = []
-CURRENT_QUESTION = {}
-PLAYER_SCORE = 0
-QUESTIONS_ASKED = 0  # Số câu hỏi đã trả lời
-ANSWER_TIMEOUT = False  # Trạng thái hết giờ cho câu hỏi hiện tại
-CURRENT_JOB = None  # Lưu công việc đếm giờ hiện tại
+# States
+QUIZ, WAIT_ANSWER = range(2)
 
-# Hàm tải câu hỏi từ Google Sheets ở dạng CSV
+# Logging
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Load Questions
 def load_questions():
-    global QUESTIONS
-    response = requests.get(GOOGLE_SHEET_CSV_URL)
-    response.raise_for_status()
-    csv_data = response.content.decode('utf-8')
+    try:
+        data = pd.read_csv(SHEET_URL)
+        questions = data.to_dict(orient="records")
+        valid_questions = []
+        for q in questions:
+            if all(k in q for k in ["Question", "Option 1", "Option 2", "Option 3", "Option 4", "Answer", "Explanation"]) and q["Answer"] in [1, 2, 3, 4]:
+                valid_questions.append(q)
+        random.shuffle(valid_questions)
+        return valid_questions[:20]
+    except Exception as e:
+        logger.error(f"Error loading questions: {e}")
+        return []
 
-    # Đọc dữ liệu CSV
-    reader = csv.DictReader(StringIO(csv_data))
-    QUESTIONS = []  # Reset câu hỏi
-    for row in reader:
-        question = {
-            "question": row['Question'],
-            "options": [row['Option 1'], row['Option 2'], row['Option 3']],
-            "answer": row['Answer']
-        }
-        QUESTIONS.append(question)
+# Start Command
+def start(update: Update, context: CallbackContext):
+    context.user_data["questions"] = load_questions()
+    context.user_data["current_question"] = 0
+    context.user_data["score"] = 0
 
-# Hàm tạo ảnh kết quả với nền
-async def create_summary_image(score, rank):
-    background_path = "/mnt/data/Slide457.png"  # Đường dẫn tới ảnh nền
-    background = Image.open(background_path)
-
-    # Tạo vùng vẽ trên ảnh
-    draw = ImageDraw.Draw(background)
-
-    # Font chữ
-    font_title = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 55)
-    font_body = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 35)
-
-    # Tính toán vị trí chữ
-    image_width, image_height = background.size
-    title_text = "KẾT QUẢ QUIZ"
-    score_text = f"Điểm: {score}/20"
-    rank_text = f"Danh hiệu: {rank}"
-
-    title_position = ((image_width - draw.textsize(title_text, font=font_title)[0]) // 2, 40)
-    score_position = ((image_width - draw.textsize(score_text, font=font_body)[0]) // 2, image_height // 2 + 110)
-    rank_position = ((image_width - draw.textsize(rank_text, font=font_body)[0]) // 2, image_height // 2 + 140)
-
-    # Vẽ chữ lên ảnh
-    draw.text(title_position, title_text, fill="white", font=font_title)
-    draw.text(score_position, score_text, fill="yellow", font=font_body)
-    draw.text(rank_position, rank_text, fill="green", font=font_body)
-
-    # Lưu ảnh kết quả
-    result_path = "/tmp/quiz_summary.png"
-    background.save(result_path)
-    return result_path
-
-# Hàm hiển thị tổng kết
-async def send_summary(update: Update):
-    global PLAYER_SCORE, QUESTIONS_ASKED, CURRENT_QUESTION
-    rank = (
-        "Nhà đầu tư thiên tài! 🎉" if PLAYER_SCORE > 15 else
-        "Nhà đầu tư tiềm năng." if 10 <= PLAYER_SCORE <= 15 else
-        "Cần học hỏi thêm!"
-    )
-
-    # Tạo ảnh tổng kết
-    file_path = await create_summary_image(PLAYER_SCORE, rank)
-
-    # Nút chia sẻ
-    share_keyboard = [
-        [
-            InlineKeyboardButton("📤 Chia sẻ lên Facebook", url="https://www.facebook.com"),
-            InlineKeyboardButton("🐦 Chia sẻ lên X (Twitter)", url="https://twitter.com"),
-        ],
-        [
-            InlineKeyboardButton("📸 Hướng dẫn chia sẻ Instagram", url="https://www.instagram.com"),
-            InlineKeyboardButton("📩 Gửi sang phòng Telegram", switch_inline_query="Chia sẻ kết quả quiz!"),
-        ]
-    ]
-    reply_markup = InlineKeyboardMarkup(share_keyboard)
-
-    # Gửi ảnh và tổng kết
-    await update.message.reply_photo(photo=open(file_path, 'rb'), caption="🏆 Tổng kết quiz của bạn!", reply_markup=reply_markup)
-
-    # Reset trạng thái
-    QUESTIONS_ASKED = 0
-    PLAYER_SCORE = 0
-    CURRENT_QUESTION = {}
-
-# Hàm xử lý lời chào tự động
-async def auto_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    welcome_text = (
-        "🎉 Chào mừng bạn đến với Gameshow 'Ai Là Nhà Đầu Tư Tài Ba'!\n\n"
-        "📋 Luật chơi:\n"
-        "- Có 20 câu hỏi với tổng số điểm tối đa là 20.\n"
-        "- Mỗi câu trả lời đúng được 1 điểm.\n"
-        "- Nếu không trả lời trong 60 giây, bạn sẽ bị tính 0 điểm cho câu đó.\n\n"
-        "✨ Mục tiêu của bạn:\n"
-        "- Trên 15 điểm: Nhà đầu tư thiên tài.\n"
-        "- Từ 10 đến 15 điểm: Nhà đầu tư tiềm năng.\n"
-        "- Dưới 10 điểm: Cần học hỏi thêm!\n\n"
-        "👉 Nhấn /quiz để bắt đầu!"
-    )
-    await update.message.reply_text(welcome_text)
-
-# Hàm bắt đầu quiz
-async def quiz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    global CURRENT_QUESTION, QUESTIONS_ASKED, PLAYER_SCORE, ANSWER_TIMEOUT, CURRENT_JOB
-
-    if QUESTIONS_ASKED >= 20:
-        await send_summary(update)
+    if not context.user_data["questions"]:
+        update.message.reply_text("⚠️ Không thể tải câu hỏi. Vui lòng thử lại sau.")
         return
 
-    if CURRENT_JOB:  # Hủy công việc đếm giờ trước đó nếu có
-        CURRENT_JOB.schedule_removal()
-
-    CURRENT_QUESTION = random.choice(QUESTIONS)
-    QUESTIONS_ASKED += 1
-    ANSWER_TIMEOUT = False
-    question_text = CURRENT_QUESTION["question"]
-    options = "\n".join([f"{i + 1}. {opt}" for i, opt in enumerate(CURRENT_QUESTION["options"])])
-    await update.message.reply_text(
-        f"Câu {QUESTIONS_ASKED}: {question_text}\n\n{options}\n\n⏳ Bạn có 60 giây để trả lời!"
+    update.message.reply_text(
+        "🎉 Chào mừng bạn đến với quiz 'Tìm Hiểu Việt Nam'!\n\n"
+        "📜 *Luật chơi:*\n"
+        "- Có 20 câu hỏi.\n"
+        "- Mỗi câu trả lời đúng được 1 điểm.\n"
+        "- Nếu không trả lời trong 60 giây, bạn sẽ bị tính 0 điểm.\n\n"
+        "🔥 Bạn đã sẵn sàng? Nhấn /quiz để bắt đầu trả lời các câu hỏi!"
     )
 
-    # Hẹn giờ 60 giây
-    CURRENT_JOB = context.job_queue.run_once(timeout_question, 60, data={'chat_id': update.message.chat_id})
+# Quiz Command
+def quiz(update: Update, context: CallbackContext):
+    context.user_data["questions"] = load_questions()
+    context.user_data["current_question"] = 0
+    context.user_data["score"] = 0
 
-# Hẹn giờ 60 giây cho câu hỏi
-async def timeout_question(context: ContextTypes.DEFAULT_TYPE):
-    global ANSWER_TIMEOUT, CURRENT_JOB
-    chat_id = context.job.data['chat_id']
-    if not ANSWER_TIMEOUT:  # Chỉ báo hết giờ nếu chưa trả lời
-        ANSWER_TIMEOUT = True
-        CURRENT_JOB = None  # Xóa công việc hiện tại
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="⏱ Hết giờ! Bạn bị tính 0 điểm cho câu hỏi này.\n\nNhấn /quiz để tiếp tục câu hỏi tiếp theo."
+    if not context.user_data["questions"]:
+        update.message.reply_text("⚠️ Không thể tải câu hỏi. Vui lòng thử lại sau.")
+        return
+
+    ask_question(update, context)
+
+# Ask Next Question
+def ask_question(update: Update, context: CallbackContext):
+    user_data = context.user_data
+    current = user_data["current_question"]
+    questions = user_data["questions"]
+
+    # Cancel existing timeout job if any
+    if "timeout_job" in user_data and user_data["timeout_job"] is not None:
+        try:
+            user_data["timeout_job"].remove()
+        except ConflictingIdError:
+            pass
+
+    if current < len(questions):
+        question = questions[current]
+        options = [question["Option 1"], question["Option 2"], question["Option 3"], question["Option 4"]]
+        user_data["current_question"] += 1
+
+        reply_markup = ReplyKeyboardMarkup([[1, 2, 3, 4]], one_time_keyboard=True)
+        update.message.reply_text(
+            f"💬 Câu {current + 1}: {question['Question']}\n\n"
+            f"1️⃣ {options[0]}\n"
+            f"2️⃣ {options[1]}\n"
+            f"3️⃣ {options[2]}\n"
+            f"4️⃣ {options[3]}",
+            reply_markup=reply_markup,
         )
 
-# Hàm xử lý câu trả lời
-async def answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    global CURRENT_QUESTION, PLAYER_SCORE, ANSWER_TIMEOUT, CURRENT_JOB
+        # Schedule a timeout job
+        timeout_job = context.job_queue.run_once(timeout_handler, 60, context=update.message.chat_id)
+        user_data["timeout_job"] = timeout_job
+    else:
+        finish_quiz(update, context)
 
-    if ANSWER_TIMEOUT:
-        await update.message.reply_text("⏱ Hết giờ! Đáp án của bạn không được chấp nhận.\n\nNhấn /quiz để tiếp tục.")
+# Timeout Handler
+def timeout_handler(context: CallbackContext):
+    chat_id = context.job.context
+    bot = context.bot
+
+    user_data = context.dispatcher.user_data.get(chat_id, {})
+    current = user_data.get("current_question", 0)
+    questions = user_data.get("questions", [])
+
+    if current < len(questions):
+        bot.send_message(
+            chat_id=chat_id,
+            text=f"⏳ Hết thời gian cho câu này! Tổng điểm hiện tại của bạn là {user_data['score']}/20."
+        )
+        ask_question_via_context(context, chat_id)
+    else:
+        finish_quiz_via_context(context, chat_id)
+
+# Ask Question via Context
+def ask_question_via_context(context: CallbackContext, chat_id):
+    user_data = context.dispatcher.user_data[chat_id]
+    current = user_data.get("current_question", 0)
+    questions = user_data.get("questions", [])
+
+    if current < len(questions):
+        question = questions[current]
+        options = [question["Option 1"], question["Option 2"], question["Option 3"], question["Option 4"]]
+        user_data["current_question"] += 1
+
+        context.bot.send_message(
+            chat_id=chat_id,
+            text=f"💬 *Câu {current + 1}:* {question['Question']}\n\n"
+                 f"1️⃣ {options[0]}\n"
+                 f"2️⃣ {options[1]}\n"
+                 f"3️⃣ {options[2]}\n"
+                 f"4️⃣ {options[3]}",
+            reply_markup=ReplyKeyboardMarkup([[1, 2, 3, 4]], one_time_keyboard=True),
+        )
+
+        timeout_job = context.job_queue.run_once(timeout_handler, 60, context=chat_id)
+        user_data["timeout_job"] = timeout_job
+
+# Handle Answer
+def handle_answer(update: Update, context: CallbackContext):
+    user_data = context.user_data
+    current = user_data["current_question"] - 1
+    questions = user_data["questions"]
+
+    try:
+        user_answer = int(update.message.text)
+    except ValueError:
+        update.message.reply_text("⚠️ Vui lòng chọn 1, 2, 3 hoặc 4.")
         return
 
-    if CURRENT_JOB:  # Hủy công việc đếm giờ nếu người chơi trả lời
-        CURRENT_JOB.schedule_removal()
-        CURRENT_JOB = None
-
-    user_answer = update.message.text.strip()
-    correct_answer = str(CURRENT_QUESTION["answer"])
+    correct_answer = int(questions[current]["Answer"])
+    explanation = questions[current]["Explanation"]
 
     if user_answer == correct_answer:
-        PLAYER_SCORE += 1
-        await update.message.reply_text(
-            f"🎉 Chính xác! Điểm hiện tại của bạn: {PLAYER_SCORE}\n\nNhấn /quiz để tiếp tục."
-        )
+        user_data["score"] += 1
+        update.message.reply_text(f"👍 Chính xác! {explanation}\n\nTổng điểm của bạn hiện tại là {user_data['score']}/20.")
     else:
-        await update.message.reply_text(
-            f"Sai rồi! Đáp án đúng là: {correct_answer}.\n\nĐiểm hiện tại của bạn: {PLAYER_SCORE}\n\nNhấn /quiz để tiếp tục."
+        update.message.reply_text(
+            f"😥 Sai rồi! Đáp án đúng là {correct_answer}. {explanation}\n\n"
+            f"Tổng điểm hiện tại của bạn là {user_data['score']}/20."
         )
-    ANSWER_TIMEOUT = True  # Dừng đếm ngược
-    CURRENT_QUESTION = {}  # Xóa câu hỏi hiện tại
 
-# Hàm chính chạy bot
+    ask_question(update, context)
+
+# Finish Quiz
+def finish_quiz(update: Update, context: CallbackContext):
+    user_data = context.user_data
+    score = user_data.get("score", 0)
+
+    if score >= 15:
+        result = "🥇 Bạn là chuyên gia về Việt Nam!"
+    elif 12 <= score < 15:
+        result = "🥈 Kiến thức của bạn rất tốt!"
+    else:
+        result = "🥉 Hãy tìm hiểu thêm về Việt Nam nhé."
+
+    update.message.reply_text(
+        f"🎉 *Chúc mừng bạn đã hoàn thành quiz 'Tìm Hiểu Việt Nam'!*\n\n"
+        f"🏆 *Tổng điểm của bạn:* {score}/20.\n{result}"
+    )
+
+# Main Function
 def main():
-    # Tải câu hỏi
-    load_questions()
+    updater = Updater(TOKEN, use_context=True)
+    dp = updater.dispatcher
 
-    # Khởi tạo bot
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    # Clear all jobs when the bot starts
+    updater.job_queue.scheduler.remove_all_jobs()
 
-    # Đăng ký các lệnh
-    application.add_handler(CommandHandler('start', auto_welcome))
-    application.add_handler(CommandHandler('quiz', quiz))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, answer))
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(CommandHandler("quiz", quiz))
+    dp.add_handler(MessageHandler(Filters.regex("^[1-4]$"), handle_answer))
 
-    # Bắt đầu chạy bot
-    print("Bot quiz đang chạy... Nhấn Ctrl+C để dừng.")
-    application.run_polling()
+    updater.start_polling()
+    updater.idle()
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
